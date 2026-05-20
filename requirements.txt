@@ -1,0 +1,6 @@
+numpy
+scipy
+opencv-python
+pillow
+huggingface_hub
+
