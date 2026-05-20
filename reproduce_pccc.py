@@ -325,9 +325,21 @@ def make_k(focal: float, cx: float, cy: float) -> np.ndarray:
     return np.array([[float(focal), 0.0, float(cx)], [0.0, float(focal), float(cy)], [0.0, 0.0, 1.0]], dtype=np.float64)
 
 
+def make_camera_k(camera: Camera) -> np.ndarray:
+    return np.array([[float(camera.fx), 0.0, float(camera.cx)], [0.0, float(camera.fy), float(camera.cy)], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+
 def skew(t: np.ndarray) -> np.ndarray:
     x, y, z = np.asarray(t, dtype=np.float64).reshape(3)
     return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=np.float64)
+
+
+def unit_translation(t: np.ndarray) -> np.ndarray:
+    t = np.asarray(t, dtype=np.float64).reshape(3)
+    norm = float(np.linalg.norm(t))
+    if norm <= 1e-12 or not np.isfinite(norm):
+        return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    return t / norm
 
 
 def normalize_fro(matrix: np.ndarray) -> np.ndarray:
@@ -337,15 +349,56 @@ def normalize_fro(matrix: np.ndarray) -> np.ndarray:
     return matrix / norm
 
 
+def essential_from_rt(R: np.ndarray, t: np.ndarray) -> np.ndarray:
+    return normalize_fro(skew(unit_translation(t)) @ np.asarray(R, dtype=np.float64).reshape(3, 3))
+
+
 def fundamental_from_rt(K: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
-    t = np.asarray(t, dtype=np.float64).reshape(3)
-    norm = float(np.linalg.norm(t))
-    if norm <= 1e-12 or not np.isfinite(norm):
-        t = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    else:
-        t = t / norm
     k_inv = np.linalg.inv(K)
-    return normalize_fro(k_inv.T @ skew(t) @ np.asarray(R, dtype=np.float64).reshape(3, 3) @ k_inv)
+    return normalize_fro(k_inv.T @ essential_from_rt(R, t) @ k_inv)
+
+
+def rotmat_to_qvec(R: np.ndarray) -> np.ndarray:
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    trace = float(np.trace(R))
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        q = np.array([0.25 * s, (R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s], dtype=np.float64)
+    else:
+        axis = int(np.argmax(np.diag(R)))
+        if axis == 0:
+            s = math.sqrt(max(1.0 + R[0, 0] - R[1, 1] - R[2, 2], 0.0)) * 2.0
+            q = np.array([(R[2, 1] - R[1, 2]) / s, 0.25 * s, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s], dtype=np.float64)
+        elif axis == 1:
+            s = math.sqrt(max(1.0 + R[1, 1] - R[0, 0] - R[2, 2], 0.0)) * 2.0
+            q = np.array([(R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s, 0.25 * s, (R[1, 2] + R[2, 1]) / s], dtype=np.float64)
+        else:
+            s = math.sqrt(max(1.0 + R[2, 2] - R[0, 0] - R[1, 1], 0.0)) * 2.0
+            q = np.array([(R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, 0.25 * s], dtype=np.float64)
+    if q[0] < 0.0:
+        q = -q
+    return q / np.linalg.norm(q)
+
+
+def blob_doubles(values: np.ndarray) -> bytes:
+    return np.asarray(values, dtype="<f8").reshape(-1).tobytes()
+
+
+def oracle_pair_geometry(
+    *,
+    records: dict[str, tuple[int, np.ndarray, np.ndarray, np.ndarray]],
+    camera: Camera,
+    first: str,
+    second: str,
+) -> dict[str, np.ndarray]:
+    R, t = relative_pose(records, first, second)
+    K = make_camera_k(camera)
+    return {
+        "F": fundamental_from_rt(K, R, t),
+        "E": essential_from_rt(R, t),
+        "qvec": rotmat_to_qvec(R),
+        "tvec": unit_translation(t),
+    }
 
 
 def homogeneous(points: np.ndarray) -> np.ndarray:
@@ -634,15 +687,19 @@ def descriptors_to_colmap(desc: np.ndarray | None, rows: int) -> np.ndarray:
 class ColmapDbStats:
     database_path: str
     detector: str
+    geometry_mode: str
+    oracle_sampson_threshold_px: float | None
     num_images: int
     num_pairs_requested: int
     num_pairs_written: int
     num_pairs_skipped_too_few_matches: int
     num_keypoints: int
+    num_raw_matches: int
     num_matches: int
     min_matches_per_pair: int
     max_matches_per_pair: int
     mean_matches_per_pair: float
+    mean_oracle_inlier_ratio: float | None
 
 
 def build_colmap_database(
@@ -651,6 +708,10 @@ def build_colmap_database(
     database_path: Path,
     names: list[str],
     policy: str,
+    geometry_mode: str,
+    records: dict[str, tuple[int, np.ndarray, np.ndarray, np.ndarray]] | None,
+    oracle_camera: Camera | None,
+    oracle_sampson_threshold_px: float | None,
     width: int,
     height: int,
     initial_focal: float,
@@ -664,6 +725,10 @@ def build_colmap_database(
         import cv2  # type: ignore
     except ImportError as exc:
         raise RuntimeError("OpenCV is required. Install with: python -m pip install -r requirements.txt") from exc
+    if geometry_mode not in {"raw", "oracle_f", "oracle_f_inliers"}:
+        raise ValueError(f"Unknown COLMAP geometry mode: {geometry_mode!r}")
+    if geometry_mode != "raw" and (records is None or oracle_camera is None):
+        raise ValueError("Oracle COLMAP geometry modes require exact pose records and the source camera.")
 
     images = {name: cv2.imread(str(crop_dir / name), cv2.IMREAD_GRAYSCALE) for name in names}
     missing = [name for name, image in images.items() if image is None]
@@ -690,6 +755,8 @@ def build_colmap_database(
         database_path.unlink()
     conn = sqlite3.connect(database_path)
     counts: list[int] = []
+    raw_counts: list[int] = []
+    oracle_ratios: list[float] = []
     skipped = 0
     try:
         create_colmap_schema(conn)
@@ -720,6 +787,23 @@ def build_colmap_database(
                     if m.distance < ratio_test * n.distance:
                         good.append(m)
                 match_idx = np.asarray([[m.queryIdx, m.trainIdx] for m in good], dtype=np.uint32).reshape(-1, 2)
+            raw_count = int(match_idx.shape[0])
+            raw_counts.append(raw_count)
+            oracle_geometry = None
+            if geometry_mode != "raw":
+                assert records is not None and oracle_camera is not None
+                oracle_geometry = oracle_pair_geometry(records=records, camera=oracle_camera, first=first, second=second)
+                if geometry_mode == "oracle_f_inliers":
+                    if raw_count > 0:
+                        pts1 = np.asarray([kp1[int(idx)].pt for idx in match_idx[:, 0]], dtype=np.float64)
+                        pts2 = np.asarray([kp2[int(idx)].pt for idx in match_idx[:, 1]], dtype=np.float64)
+                        residuals = np.abs(sampson_signed_residuals(pts1, pts2, oracle_geometry["F"]))
+                        threshold = float(oracle_sampson_threshold_px if oracle_sampson_threshold_px is not None else 4.0)
+                        keep = residuals <= threshold
+                        match_idx = match_idx[keep].copy()
+                        oracle_ratios.append(float(np.mean(keep)) if keep.size else 0.0)
+                    else:
+                        oracle_ratios.append(0.0)
             if match_idx.shape[0] < min_matches:
                 skipped += 1
                 continue
@@ -730,10 +814,24 @@ def build_colmap_database(
             pair_id = image_pair_to_pair_id(id1, id2)
             blob = np.asarray(match_idx, dtype="<u4").reshape(-1).tobytes()
             conn.execute("INSERT INTO matches(pair_id, rows, cols, data) VALUES(?, ?, 2, ?)", (pair_id, match_idx.shape[0], blob))
-            conn.execute(
-                "INSERT INTO two_view_geometries(pair_id, rows, cols, data, config, F, E, H, qvec, tvec) VALUES(?, ?, 2, ?, 3, NULL, NULL, NULL, NULL, NULL)",
-                (pair_id, match_idx.shape[0], blob),
-            )
+            if oracle_geometry is None:
+                conn.execute(
+                    "INSERT INTO two_view_geometries(pair_id, rows, cols, data, config, F, E, H, qvec, tvec) VALUES(?, ?, 2, ?, 3, NULL, NULL, NULL, NULL, NULL)",
+                    (pair_id, match_idx.shape[0], blob),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO two_view_geometries(pair_id, rows, cols, data, config, F, E, H, qvec, tvec) VALUES(?, ?, 2, ?, 2, ?, ?, NULL, ?, ?)",
+                    (
+                        pair_id,
+                        match_idx.shape[0],
+                        blob,
+                        blob_doubles(oracle_geometry["F"]),
+                        blob_doubles(oracle_geometry["E"]),
+                        blob_doubles(oracle_geometry["qvec"]),
+                        blob_doubles(oracle_geometry["tvec"]),
+                    ),
+                )
             counts.append(int(match_idx.shape[0]))
         conn.commit()
     finally:
@@ -743,15 +841,19 @@ def build_colmap_database(
     return ColmapDbStats(
         database_path=str(database_path),
         detector=detector_name,
+        geometry_mode=geometry_mode,
+        oracle_sampson_threshold_px=float(oracle_sampson_threshold_px) if oracle_sampson_threshold_px is not None else None,
         num_images=len(names),
         num_pairs_requested=len(pairs),
         num_pairs_written=len(counts),
         num_pairs_skipped_too_few_matches=skipped,
         num_keypoints=int(num_keypoints),
+        num_raw_matches=int(sum(raw_counts)),
         num_matches=int(sum(counts)),
         min_matches_per_pair=int(min(counts)) if counts else 0,
         max_matches_per_pair=int(max(counts)) if counts else 0,
         mean_matches_per_pair=float(np.mean(counts)) if counts else 0.0,
+        mean_oracle_inlier_ratio=float(np.mean(oracle_ratios)) if oracle_ratios else None,
     )
 
 
@@ -907,6 +1009,8 @@ def run_colmap_baseline(
     output_dir: Path,
     colmap_bin: Path,
     policy: str,
+    geometry_mode: str,
+    oracle_sampson_threshold_px: float | None,
     scenes: list[str],
     counts: list[int],
     joint_rows: list[dict[str, Any]],
@@ -921,10 +1025,11 @@ def run_colmap_baseline(
         scene_name = scene["scene"]
         if scene_name not in scenes:
             continue
-        info(f"=== COLMAP known-RT {policy} {scene_name} ===")
+        info(f"=== COLMAP known-RT {policy} {geometry_mode} {scene_name} ===")
         crop_dir = Path(scene["crop_image_dir"])
         source_dir = Path(scene["source_scene_dir"])
         records = read_pose_records(source_dir / "sparse/0/images.txt")
+        oracle_camera = read_camera(source_dir / "sparse/0/cameras.txt")
         true_cx = float(scene["true_crop_principal_point"]["cx"])
         true_cy = float(scene["true_crop_principal_point"]["cy"])
         width = int(scene["crop"]["width"])
@@ -935,7 +1040,7 @@ def run_colmap_baseline(
         image_names_all = [str(n) for n in scene["selected_images"]]
         for count in counts:
             names = image_names_all[:count]
-            work_dir = output_dir / "work" / scene_name / f"N{count}_{policy}"
+            work_dir = output_dir / "work" / scene_name / f"N{count}_{policy}_{geometry_mode}"
             reset_dir(work_dir)
             db_path = work_dir / "database.db"
             db = build_colmap_database(
@@ -943,6 +1048,10 @@ def run_colmap_baseline(
                 database_path=db_path,
                 names=names,
                 policy=policy,
+                geometry_mode=geometry_mode,
+                records=records if geometry_mode != "raw" else None,
+                oracle_camera=oracle_camera if geometry_mode != "raw" else None,
+                oracle_sampson_threshold_px=oracle_sampson_threshold_px,
                 width=width,
                 height=height,
                 initial_focal=initial_focal,
@@ -967,6 +1076,8 @@ def run_colmap_baseline(
                 "scene": scene_name,
                 "num_images": int(count),
                 "pair_policy": policy,
+                "geometry_mode": geometry_mode,
+                "oracle_sampson_threshold_px": oracle_sampson_threshold_px,
                 "image_names": names,
                 "true_cx": true_cx,
                 "true_cy": true_cy,
@@ -986,7 +1097,7 @@ def run_colmap_baseline(
             rows.append(row)
             write_json(output_dir / "results.json", rows)
             err = colmap_result["intrinsics"].get("principal_error_px", math.nan)
-            info(f"{scene_name:9s} N={count:2d} pairs={db.num_pairs_written}/{db.num_pairs_requested} COLMAP={colmap_result['status']} pp={err}")
+            info(f"{scene_name:9s} N={count:2d} pairs={db.num_pairs_written}/{db.num_pairs_requested} mode={geometry_mode} COLMAP={colmap_result['status']} pp={err}")
     write_json(output_dir / "results.json", rows)
     return rows
 
@@ -1008,7 +1119,15 @@ def fmt(value: Any, digits: int = 3) -> str:
     return f"{x:.{digits}f}"
 
 
-def write_tables(*, output_dir: Path, joint_rows: list[dict[str, Any]], colmap_seq: list[dict[str, Any]] | None, colmap_all: list[dict[str, Any]] | None) -> None:
+def write_tables(
+    *,
+    output_dir: Path,
+    joint_rows: list[dict[str, Any]],
+    colmap_seq: list[dict[str, Any]] | None,
+    colmap_all: list[dict[str, Any]] | None,
+    colmap_all_oracle_f: list[dict[str, Any]] | None,
+    colmap_all_oracle_f_inliers: list[dict[str, Any]] | None,
+) -> None:
     table_dir = output_dir / "tables"
     table_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1026,12 +1145,19 @@ def write_tables(*, output_dir: Path, joint_rows: list[dict[str, Any]], colmap_s
         lines.append(f"| {r['scene']} | {fmt(r['cx'])} | {fmt(r['cy'])} | {fmt(r['focal_px'])} | {fmt(r['pp_error_px'])} | {fmt(r['objective'], 6)} |")
     (table_dir / "joint_focal_n24_per_scene.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    if colmap_seq is not None or colmap_all is not None:
+    if colmap_seq is not None or colmap_all is not None or colmap_all_oracle_f is not None or colmap_all_oracle_f_inliers is not None:
         seq_rows = colmap_seq or []
         all_rows = colmap_all or []
+        oracle_f_rows = colmap_all_oracle_f or []
+        oracle_f_inlier_rows = colmap_all_oracle_f_inliers or []
         ours = {r["scene"]: float(r["pp_error_px"]) for r in n24}
         lines = ["# PCCC main comparison", "", "| baseline | scenes | COLMAP mean pp | COLMAP median pp | ours mean pp | ours median pp | ours wins | COLMAP wins |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
-        for label, rows in [("COLMAP known-RT seq", seq_rows), ("COLMAP known-RT all", all_rows)]:
+        for label, rows in [
+            ("COLMAP known-RT seq", seq_rows),
+            ("COLMAP known-RT all", all_rows),
+            ("COLMAP known-RT all + oracle F", oracle_f_rows),
+            ("COLMAP known-RT all + oracle F inliers", oracle_f_inlier_rows),
+        ]:
             if not rows:
                 continue
             col_pp = [float(r["colmap"]["intrinsics"].get("principal_error_px", math.nan)) for r in rows]
@@ -1054,6 +1180,46 @@ def write_tables(*, output_dir: Path, joint_rows: list[dict[str, Any]], colmap_s
             lines.append(f"| {scene} | {fmt(seq_pp)} | {fmt(all_pp)} | {fmt(ours[scene])} |")
         (table_dir / "colmap_per_scene.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+        lines = [
+            "# PCCC COLMAP more-information per-scene comparison",
+            "",
+            "| scene | known-RT seq pp | known-RT all pp | all + oracle F pp | all + oracle F inliers pp | oracle inlier ratio | ours pp |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        oracle_f_by_scene = {r["scene"]: r for r in oracle_f_rows}
+        oracle_f_inlier_by_scene = {r["scene"]: r for r in oracle_f_inlier_rows}
+        for scene in SCENES:
+            if scene not in ours:
+                continue
+            seq_pp = seq_by_scene.get(scene, {}).get("colmap", {}).get("intrinsics", {}).get("principal_error_px", math.nan)
+            all_pp = all_by_scene.get(scene, {}).get("colmap", {}).get("intrinsics", {}).get("principal_error_px", math.nan)
+            oracle_f_pp = oracle_f_by_scene.get(scene, {}).get("colmap", {}).get("intrinsics", {}).get("principal_error_px", math.nan)
+            oracle_f_inlier = oracle_f_inlier_by_scene.get(scene, {})
+            oracle_f_inlier_pp = oracle_f_inlier.get("colmap", {}).get("intrinsics", {}).get("principal_error_px", math.nan)
+            inlier_ratio = oracle_f_inlier.get("database", {}).get("mean_oracle_inlier_ratio", math.nan)
+            lines.append(f"| {scene} | {fmt(seq_pp)} | {fmt(all_pp)} | {fmt(oracle_f_pp)} | {fmt(oracle_f_inlier_pp)} | {fmt(inlier_ratio)} | {fmt(ours[scene])} |")
+        (table_dir / "colmap_more_info_per_scene.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        lines = [
+            "# PCCC COLMAP more-information database stats",
+            "",
+            "| baseline | scene | pairs | raw matches | used matches | mean matches | oracle inlier ratio | points3D | status |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---|",
+        ]
+        for label, rows in [
+            ("known-RT seq", seq_rows),
+            ("known-RT all", all_rows),
+            ("all + oracle F", oracle_f_rows),
+            ("all + oracle F inliers", oracle_f_inlier_rows),
+        ]:
+            for r in rows:
+                db = r["database"]
+                colmap = r["colmap"]
+                lines.append(
+                    f"| {label} | {r['scene']} | {db['num_pairs_written']}/{db['num_pairs_requested']} | {db.get('num_raw_matches', db.get('num_matches', 0))} | {db.get('num_matches', 0)} | {fmt(db.get('mean_matches_per_pair', math.nan))} | {fmt(db.get('mean_oracle_inlier_ratio', math.nan))} | {colmap.get('points3D', 0)} | {colmap.get('status', '')} |"
+                )
+        (table_dir / "colmap_more_info_database_stats.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Standalone PCCC reproduction: data, COLMAP, joint focal, and tables.")
@@ -1061,12 +1227,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-tanks-root", type=Path, default=None)
     parser.add_argument("--colmap-bin", default=None)
     parser.add_argument("--scenes", nargs="*", default=SCENES)
-    parser.add_argument("--counts", type=int, nargs="+", default=[6, 12, 24])
+    parser.add_argument("--counts", type=int, nargs="+", default=[24])
     parser.add_argument("--crop-size", type=int, default=480)
     parser.add_argument("--max-features", type=int, default=6000)
     parser.add_argument("--ratio-test", type=float, default=0.75)
     parser.add_argument("--trim-quantile", type=float, default=0.9)
     parser.add_argument("--skip-colmap", action="store_true")
+    parser.add_argument("--skip-colmap-more-info", action="store_true")
+    parser.add_argument("--oracle-f-inlier-threshold-px", type=float, default=4.0)
     parser.add_argument("--clean", action="store_true")
     return parser.parse_args()
 
@@ -1095,6 +1263,8 @@ def main() -> None:
 
     colmap_seq = None
     colmap_all = None
+    colmap_all_oracle_f = None
+    colmap_all_oracle_f_inliers = None
     if colmap_bin is not None:
         colmap_counts = [count for count in args.counts if int(count) == 24]
         if not colmap_counts:
@@ -1104,6 +1274,8 @@ def main() -> None:
             output_dir=results_root / "colmap_known_rt_seq",
             colmap_bin=colmap_bin,
             policy="seq",
+            geometry_mode="raw",
+            oracle_sampson_threshold_px=None,
             scenes=list(args.scenes),
             counts=colmap_counts,
             joint_rows=joint_rows,
@@ -1115,17 +1287,52 @@ def main() -> None:
             output_dir=results_root / "colmap_known_rt_all",
             colmap_bin=colmap_bin,
             policy="all",
+            geometry_mode="raw",
+            oracle_sampson_threshold_px=None,
             scenes=list(args.scenes),
             counts=colmap_counts,
             joint_rows=joint_rows,
             max_features=int(args.max_features),
             ratio_test=float(args.ratio_test),
         )
+        if not args.skip_colmap_more_info:
+            colmap_all_oracle_f = run_colmap_baseline(
+                manifest_path=manifest_path,
+                output_dir=results_root / "colmap_known_rt_all_oracle_f",
+                colmap_bin=colmap_bin,
+                policy="all",
+                geometry_mode="oracle_f",
+                oracle_sampson_threshold_px=None,
+                scenes=list(args.scenes),
+                counts=colmap_counts,
+                joint_rows=joint_rows,
+                max_features=int(args.max_features),
+                ratio_test=float(args.ratio_test),
+            )
+            colmap_all_oracle_f_inliers = run_colmap_baseline(
+                manifest_path=manifest_path,
+                output_dir=results_root / "colmap_known_rt_all_oracle_f_inliers",
+                colmap_bin=colmap_bin,
+                policy="all",
+                geometry_mode="oracle_f_inliers",
+                oracle_sampson_threshold_px=float(args.oracle_f_inlier_threshold_px),
+                scenes=list(args.scenes),
+                counts=colmap_counts,
+                joint_rows=joint_rows,
+                max_features=int(args.max_features),
+                ratio_test=float(args.ratio_test),
+            )
 
-    write_tables(output_dir=results_root, joint_rows=joint_rows, colmap_seq=colmap_seq, colmap_all=colmap_all)
+    write_tables(
+        output_dir=results_root,
+        joint_rows=joint_rows,
+        colmap_seq=colmap_seq,
+        colmap_all=colmap_all,
+        colmap_all_oracle_f=colmap_all_oracle_f,
+        colmap_all_oracle_f_inliers=colmap_all_oracle_f_inliers,
+    )
     info(f"WROTE {results_root / 'tables'}")
 
 
 if __name__ == "__main__":
     main()
-

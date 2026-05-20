@@ -25,7 +25,9 @@ What it does:
    unless `COLMAP_BIN` or `--colmap-bin` is provided.
 4. Runs the paper mainline: pose-conditioned joint focal recovery.
 5. Runs the paper COLMAP known-RT baselines for `seq` and `all` pair graphs.
-6. Writes paper tables under `work/results/tables`.
+6. Runs the more-information COLMAP controls: `all + oracle F` and
+   `all + oracle F inliers`, both still under the same known-RT protocol.
+7. Writes paper tables under `work/results/tables`.
 
 Useful shorter commands:
 
@@ -36,8 +38,14 @@ python .\reproduce_pccc.py --source-tanks-root C:\path\to\InstantSplat\Tanks
 # Only run the paper method, no COLMAP baseline.
 python .\reproduce_pccc.py --skip-colmap
 
+# Skip only the extra oracle-F COLMAP controls.
+python .\reproduce_pccc.py --skip-colmap-more-info
+
 # Smoke test one scene.
 python .\reproduce_pccc.py --scenes Ballroom --counts 24 --skip-colmap
+
+# Optional development-only N sweep.
+python .\reproduce_pccc.py --counts 6 12 24 --skip-colmap
 ```
 
 Outputs:
@@ -48,5 +56,9 @@ Outputs:
 - `work/results/joint_focal/results.json`: paper method results.
 - `work/results/colmap_known_rt_seq/results.json`: COLMAP seq baseline.
 - `work/results/colmap_known_rt_all/results.json`: COLMAP all-pair baseline.
+- `work/results/colmap_known_rt_all_oracle_f/results.json`: COLMAP all-pair
+  baseline with exact-pose/GT-intrinsics pairwise geometry written into
+  `two_view_geometries`.
+- `work/results/colmap_known_rt_all_oracle_f_inliers/results.json`: the same,
+  with matches filtered by oracle Sampson residual before COLMAP triangulation.
 - `work/results/tables/*.md`: paper-ready tables.
-
